@@ -306,6 +306,8 @@ namespace visage {
   }
 
   Font Font::withDpiScale(float dpi_scale) const {
+    if (dpi_scale_ == dpi_scale)
+      return *this;  // Fast path: avoid allocation when scale unchanged
     if (packed_font_ == nullptr)
       return { size_, nullptr, 0, dpi_scale };
     return { size_, packed_font_->data(), packed_font_->dataSize(), dpi_scale };

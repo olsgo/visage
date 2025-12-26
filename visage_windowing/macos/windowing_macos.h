@@ -35,12 +35,7 @@ namespace visage {
 @interface VisageDraggingSource : NSObject <NSDraggingSource>
 @end
 
-@interface VisageAppViewDelegate : NSObject <MTKViewDelegate>
-@property(nonatomic) visage::WindowMac* visage_window;
-@property long long start_microseconds;
-@end
-
-@interface VisageAppView : MTKView <NSDraggingDestination>
+@interface VisageAppView : NSView <NSDraggingDestination, CALayerDelegate>
 @property(nonatomic) visage::WindowMac* visage_window;
 @property(strong) VisageDraggingSource* drag_source;
 @property bool allow_quit;
@@ -92,13 +87,13 @@ namespace visage {
 
     void handleNativeResize(int width, int height);
     bool isPopup() const { return decoration_ == Decoration::Popup; }
+    bool isEmbedded() const { return parent_view_ != nullptr; }
 
   private:
     static bool running_event_loop_;
     NSWindow* window_handle_ = nullptr;
     NSView* parent_view_ = nullptr;
     VisageAppView* view_ = nullptr;
-    VisageAppViewDelegate* view_delegate_ = nullptr;
     NSRect last_content_rect_ {};
     Decoration decoration_ = Decoration::Native;
   };

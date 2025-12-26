@@ -281,6 +281,16 @@ namespace visage {
     MouseEvent mouse_event = buttonMouseEvent(button_id, x, y, button_state, modifiers);
     mouse_event.repeat_click_count = repeat;
 
+    // Debug: log coordinates and frame bounds
+    if (std::getenv("NUPG_VISAGE_DEBUG") && std::getenv("NUPG_VISAGE_DEBUG")[0] != '0') {
+      Bounds cb = content_frame_->bounds();
+      fprintf(stderr, "[nuPG][Visage][hitTest] raw=%d,%d logical=%.1f,%.1f scale=%.2f contentBounds=%.1f,%.1f,%.1fx%.1f\n",
+              x, y,
+              mouse_event.window_position.x, mouse_event.window_position.y,
+              window_->dpiScale(),
+              cb.x(), cb.y(), cb.width(), cb.height());
+    }
+
     mouse_down_frame_ = content_frame_->frameAtPoint(mouse_event.window_position);
     temporary_frame_ = mouse_down_frame_;
     while (temporary_frame_ && !temporary_frame_->acceptsKeystrokes())

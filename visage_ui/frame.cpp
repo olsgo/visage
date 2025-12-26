@@ -324,6 +324,22 @@ namespace visage {
     return false;
   }
 
+  void Frame::setDpiScale(float dpi_scale) {
+    bool changed = dpi_scale_ != dpi_scale;
+    dpi_scale_ = dpi_scale;
+
+    if (changed) {
+      native_bounds_ = (bounds_ * dpi_scale_).round();
+      region_.setBounds(native_bounds_.x(), native_bounds_.y(), native_bounds_.width(),
+                        native_bounds_.height());
+      on_dpi_change_.callback();
+      redraw();
+    }
+
+    for (Frame* child : children_)
+      child->setDpiScale(dpi_scale);
+  }
+
   void Frame::initChildren() {
     if (initialized_)
       return;

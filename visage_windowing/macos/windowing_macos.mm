@@ -26,6 +26,40 @@
 #include "visage_utils/time_utils.h"
 
 #include <map>
+#include <atomic>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+
+namespace {
+  bool visageDebugEnabled() {
+    static const bool enabled = []() {
+      const char* env = std::getenv("NUPG_VISAGE_DEBUG");
+      return env && *env && *env != '0';
+    }();
+    return enabled;
+  }
+
+  void visageDebugLog(const char* tag, const char* format, ...) {
+    if (!visageDebugEnabled())
+      return;
+    std::fprintf(stderr, "[nuPG][Visage][%s] ", tag);
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+    std::fprintf(stderr, "\n");
+  }
+
+  bool shouldLogEvery(uint64_t& last_us, uint64_t interval_us) {
+    const uint64_t now = visage::time::microseconds();
+    if (now - last_us >= interval_us) {
+      last_us = now;
+      return true;
+    }
+    return false;
+  }
+}
 
 namespace visage {
 
@@ -80,20 +114,9 @@ namespace visage {
 
   class InitialMetalLayer {
   public:
-    static CAMetalLayer* layer() { return instance().metal_layer_; }
-
+    static CAMetalLayer* layer() { return nullptr; } // Deprecated/Unused
   private:
-    static InitialMetalLayer& instance() {
-      static InitialMetalLayer instance;
-      return instance;
-    }
-
-    InitialMetalLayer() {
-      metal_layer_ = [CAMetalLayer layer];
-      metal_layer_.colorspace = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
-    }
-
-    CAMetalLayer* metal_layer_ = nullptr;
+    InitialMetalLayer() = default;
   };
 
   std::string readClipboardText() {
@@ -320,29 +343,14 @@ namespace visage {
 }
 @end
 
-@implementation VisageAppViewDelegate
-- (instancetype)initWithWindow:(visage::WindowMac*)window {
-  self = [super init];
-  self.visage_window = window;
-  self.start_microseconds = visage::time::microseconds();
-  return self;
-}
-
-- (void)drawWindow {
-  long long ms = visage::time::microseconds();
-  self.visage_window->drawCallback((ms - self.start_microseconds) / 1000000.0);
-}
-
-- (void)mtkView:(MTKView*)view drawableSizeWillChange:(CGSize)size {
-  self.visage_window->handleNativeResize(size.width, size.height);
-}
-
-- (void)drawInMTKView:(MTKView*)view {
-  if (!view.currentDrawable || !view.currentRenderPassDescriptor)
-    return;
-
-  view.layer.contentsScale = self.visage_window->dpiScale();
-  [self drawWindow];
+@interface VisageAppView () {
+  CVDisplayLinkRef displayLink;
+  NSTrackingArea* trackingArea;
+  uint64_t last_display_log_us;
+  uint64_t last_draw_log_us;
+  uint64_t last_render_us;  // Frame throttling: track last actual render
+  uint64_t display_count;
+  uint64_t draw_count;
 }
 @end
 
@@ -350,21 +358,238 @@ namespace visage {
 - (instancetype)initWithFrame:(NSRect)frame_rect inWindow:(visage::WindowMac*)window {
   self = [super initWithFrame:frame_rect];
   self.visage_window = window;
-  self.device = MTLCreateSystemDefaultDevice();
-  self.clearColor = MTLClearColorMake(0.1, 0.1, 0.1, 1.0);
-  self.enableSetNeedsDisplay = NO;
-  self.framebufferOnly = YES;
+  self.allow_quit = NO;
+  trackingArea = nil;
+  last_display_log_us = 0;
+  last_draw_log_us = 0;
+  last_render_us = 0;
+  display_count = 0;
+  draw_count = 0;
+
+  [self setWantsLayer:YES];
+  self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
   self.layerContentsPlacement = NSViewLayerContentsPlacementTopLeft;
-  self.preferredFramesPerSecond = 120;
+
+  [self updateMetalLayerDrawableSize];
 
   [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
   self.drag_source = [[VisageDraggingSource alloc] init];
 
+  // Setup CVDisplayLink
+  CVDisplayLinkCreateWithActiveCGDisplays(&displayLink);
+  CVDisplayLinkSetOutputCallback(displayLink, &DisplayLinkCallback, (__bridge void*)self);
+  CVDisplayLinkStart(displayLink);
+
+  visageDebugLog("view", "init frame=%.1fx%.1f", frame_rect.size.width, frame_rect.size.height);
   return self;
+}
+
+// Create a CAMetalLayer backing layer configured for bgfx rendering.
+- (CALayer*)makeBackingLayer {
+  CAMetalLayer* metalLayer = [CAMetalLayer layer];
+  metalLayer.device = MTLCreateSystemDefaultDevice();
+  metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+  metalLayer.framebufferOnly = YES;
+  metalLayer.opaque = YES;
+  metalLayer.needsDisplayOnBoundsChange = YES;
+  metalLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+  metalLayer.delegate = self;
+
+  CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+  metalLayer.colorspace = colorSpace;
+  if (colorSpace)
+    CGColorSpaceRelease(colorSpace);
+
+  if (@available(macOS 10.13, *)) {
+    metalLayer.displaySyncEnabled = YES;
+  }
+  if (@available(macOS 10.13.2, *)) {
+    metalLayer.maximumDrawableCount = 2;
+  }
+  // presentsWithTransaction = NO for async presentation.
+  // YES can cause synchronous blocking in plugin contexts where we're embedded
+  // in JUCE's window hierarchy and competing for Core Animation transactions.
+  metalLayer.presentsWithTransaction = NO;
+  if (@available(macOS 10.15, *)) {
+    metalLayer.wantsExtendedDynamicRangeContent = YES;
+  }
+  if (visageDebugEnabled()) {
+    visageDebugLog("layer",
+                   "created device=%p pixelFormat=%d framebufferOnly=%d",
+                   metalLayer.device,
+                   (int)metalLayer.pixelFormat,
+                   metalLayer.framebufferOnly ? 1 : 0);
+  }
+  return metalLayer;
+}
+
+static CVReturn DisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeStamp* now,
+                                    const CVTimeStamp* outputTime, CVOptionFlags flagsIn,
+                                    CVOptionFlags* flagsOut, void* displayLinkContext) {
+  VisageAppView* view = (__bridge VisageAppView*)displayLinkContext;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [view markNeedsDisplayFromDisplayLink];
+  });
+  return kCVReturnSuccess;
+}
+
+// Triggered by CVDisplayLink on the main thread.
+// Frame throttling: limit effective frame rate to ~30Hz to avoid overwhelming
+// the JUCE message pump. CVDisplayLink fires at 60Hz+ but our UI only needs 30Hz.
+- (void)markNeedsDisplayFromDisplayLink {
+  CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
+  display_count++;
+
+  // Frame throttling: skip if less than 30ms since last render (cap at ~33Hz)
+  // This prevents CVDisplayLink from flooding the main queue at 60Hz
+  static constexpr uint64_t kMinFrameIntervalUs = 30000;  // 30ms = ~33Hz
+  const uint64_t now_us = visage::time::microseconds();
+  if (last_render_us > 0 && (now_us - last_render_us) < kMinFrameIntervalUs) {
+    return;  // Skip this frame - too soon since last render
+  }
+
+  if (visageDebugEnabled() && shouldLogEvery(last_display_log_us, 1000000)) {
+    const CGSize bounds_size = self.bounds.size;
+    const CGSize drawable_size = metalLayer ? metalLayer.drawableSize : CGSizeZero;
+    visageDebugLog(
+        "displaylink",
+        "ticks=%llu window=%p visible=%d bounds=%.1fx%.1f drawable=%.1fx%.1f scale=%.2f",
+        static_cast<unsigned long long>(display_count),
+        self.window,
+        self.window ? (int)self.window.visible : 0,
+        bounds_size.width,
+        bounds_size.height,
+        drawable_size.width,
+        drawable_size.height,
+        metalLayer ? metalLayer.contentsScale : 0.0);
+  }
+
+  if (metalLayer)
+    [metalLayer setNeedsDisplay];
+  else
+    [self setNeedsDisplay:YES];
+}
+
+// Triggered by setNeedsDisplay on the CAMetalLayer.
+- (void)displayLayer:(CALayer*)layer {
+  (void)layer;
+  draw_count++;
+  const uint64_t start_us = visage::time::microseconds();
+  [self drawWindow];
+  const uint64_t end_us = visage::time::microseconds();
+  const uint64_t duration_us = end_us - start_us;
+
+  // Update last render time for frame throttling
+  last_render_us = end_us;
+
+  if (visageDebugEnabled() && (duration_us > 12000 || shouldLogEvery(last_draw_log_us, 1000000))) {
+    const CGSize bounds_size = self.bounds.size;
+    CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
+    const CGSize drawable_size = metalLayer ? metalLayer.drawableSize : CGSizeZero;
+    visageDebugLog(
+        "displayLayer",
+        "frames=%llu draw_us=%llu bounds=%.1fx%.1f drawable=%.1fx%.1f stale_window=%p",
+        static_cast<unsigned long long>(draw_count),
+        static_cast<unsigned long long>(duration_us),
+        bounds_size.width,
+        bounds_size.height,
+        drawable_size.width,
+        drawable_size.height,
+        self.visage_window);
+  }
+}
+
+- (void)setFrameSize:(NSSize)newSize {
+  [super setFrameSize:newSize];
+  [self updateMetalLayerDrawableSize];
+}
+
+- (void)updateMetalLayerDrawableSize {
+  CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
+  if (!metalLayer)
+    return;
+
+  CGFloat scale = 1.0;
+  if (self.window) {
+    scale = self.window.backingScaleFactor;
+  } else if (metalLayer.contentsScale > 0.0) {
+    scale = metalLayer.contentsScale;
+  }
+  metalLayer.contentsScale = scale;
+  const CGSize size = self.bounds.size;
+  metalLayer.drawableSize = CGSizeMake(size.width * scale, size.height * scale);
+
+  if (visageDebugEnabled()) {
+    static uint64_t last_resize_log_us = 0;
+    if (shouldLogEvery(last_resize_log_us, 1000000)) {
+      visageDebugLog("drawable",
+                     "scale=%.2f bounds=%.1fx%.1f drawable=%.1fx%.1f",
+                     scale,
+                     size.width,
+                     size.height,
+                     metalLayer.drawableSize.width,
+                     metalLayer.drawableSize.height);
+    }
+  }
+}
+
+- (void)drawWindow {
+  @autoreleasepool {
+    if (self.visage_window) {
+      self.visage_window->drawCallback(visage::time::microseconds() / 1000000.0);
+    } else if (visageDebugEnabled()) {
+      static uint64_t last_missing_log_us = 0;
+      if (shouldLogEvery(last_missing_log_us, 1000000))
+        visageDebugLog("drawWindow", "missing visage_window");
+    }
+  }
+}
+
+- (void)dealloc {
+  if (trackingArea) {
+    [self removeTrackingArea:trackingArea];
+    trackingArea = nil;
+  }
+  if (displayLink) {
+    CVDisplayLinkStop(displayLink);
+    CVDisplayLinkRelease(displayLink);
+  }
 }
 
 - (BOOL)acceptsFirstResponder {
   return YES;
+}
+
+- (BOOL)acceptsFirstMouse:(NSEvent*)event {
+  // Accept mouse clicks even when window is not key - essential for plugin windows
+  return YES;
+}
+
+- (void)updateTrackingAreas {
+  [super updateTrackingAreas];
+
+  // Remove old tracking area
+  if (trackingArea != nil) {
+    [self removeTrackingArea:trackingArea];
+    trackingArea = nil;
+  }
+
+  // Create new tracking area covering the entire view
+  NSTrackingAreaOptions options = NSTrackingMouseEnteredAndExited |
+                                   NSTrackingMouseMoved |
+                                   NSTrackingActiveAlways |
+                                   NSTrackingInVisibleRect;
+  trackingArea = [[NSTrackingArea alloc] initWithRect:NSZeroRect
+                                               options:options
+                                                 owner:self
+                                              userInfo:nil];
+  [self addTrackingArea:trackingArea];
+
+  if (visageDebugEnabled()) {
+    static uint64_t last_log_us = 0;
+    if (shouldLogEvery(last_log_us, 1000000))
+      visageDebugLog("tracking", "updated bounds=%.1fx%.1f", self.bounds.size.width, self.bounds.size.height);
+  }
 }
 
 - (void)keyDown:(NSEvent*)event {
@@ -430,7 +655,22 @@ namespace visage {
   NSPoint location = [event locationInWindow];
   NSPoint view_location = [self convertPoint:location fromView:nil];
   CGFloat view_height = self.frame.size.height;
-  return visage::Point(view_location.x, view_height - view_location.y) * self.visage_window->dpiScale();
+  visage::Point result = visage::Point(view_location.x, view_height - view_location.y) * self.visage_window->dpiScale();
+
+  if (visageDebugEnabled()) {
+    static uint64_t last_coord_log_us = 0;
+    if (shouldLogEvery(last_coord_log_us, 2000000)) {
+      NSRect frameInWindow = [self convertRect:self.bounds toView:nil];
+      visageDebugLog("eventPos", "winLoc=%.1f,%.1f viewLoc=%.1f,%.1f viewH=%.1f scale=%.2f result=%.1f,%.1f frameInWin=%.1f,%.1f,%.1fx%.1f",
+                     location.x, location.y,
+                     view_location.x, view_location.y,
+                     view_height, self.visage_window->dpiScale(),
+                     result.x, result.y,
+                     frameInWindow.origin.x, frameInWindow.origin.y,
+                     frameInWindow.size.width, frameInWindow.size.height);
+    }
+  }
+  return result;
 }
 
 - (visage::Point)dragPosition:(id<NSDraggingInfo>)sender {
@@ -505,6 +745,11 @@ namespace visage {
 
 - (void)mouseMoved:(NSEvent*)event {
   visage::Point point = [self eventPosition:event];
+  if (visageDebugEnabled()) {
+    static uint64_t last_log_us = 0;
+    if (shouldLogEvery(last_log_us, 1000000))
+      visageDebugLog("mouseMoved", "point=%.1f,%.1f", point.x, point.y);
+  }
   self.visage_window->handleMouseMove(point.x, point.y, [self mouseButtonState],
                                       [self keyboardModifiers:event]);
 }
@@ -522,6 +767,11 @@ namespace visage {
 - (void)mouseDown:(NSEvent*)event {
   visage::Point point = [self eventPosition:event];
   self.mouse_down_screen_position = [self mouseScreenPosition];
+  if (visageDebugEnabled()) {
+    static uint64_t last_log_us = 0;
+    if (shouldLogEvery(last_log_us, 100000))
+      visageDebugLog("mouseDown", "point=%.1f,%.1f window=%p", point.x, point.y, self.window);
+  }
   self.visage_window->handleMouseDown(visage::kMouseButtonLeft, point.x, point.y,
                                       [self mouseButtonState], [self keyboardModifiers:event]);
   [self makeKeyWindow];
@@ -611,8 +861,14 @@ namespace visage {
 
 - (void)viewDidChangeBackingProperties {
   [super viewDidChangeBackingProperties];
+  [self updateMetalLayerDrawableSize];
   if (self.visage_window)
     self.visage_window->resetBackingScale();
+  if (visageDebugEnabled()) {
+    static uint64_t last_backing_log_us = 0;
+    if (shouldLogEvery(last_backing_log_us, 1000000))
+      visageDebugLog("backing", "backingScale=%.2f", self.window ? self.window.backingScaleFactor : 0.0);
+  }
 }
 
 - (void)viewWillMoveToWindow:(NSWindow*)new_window {
@@ -625,10 +881,22 @@ namespace visage {
     if (self.visage_window)
       self.visage_window->setParentWindow(new_window);
 
-    [[NSNotificationCenter defaultCenter] addObserver:self
-                                             selector:@selector(windowOcclusionChanged:)
-                                                 name:NSWindowDidChangeOcclusionStateNotification
-                                               object:new_window];
+    // Only track occlusion for standalone windows. Embedded plugin windows
+    // don't own their parent window and get spurious occlusion state changes
+    // from the host DAW's window management, causing draw starvation.
+    const bool embedded = self.visage_window && self.visage_window->isEmbedded();
+    if (!embedded) {
+      [[NSNotificationCenter defaultCenter] addObserver:self
+                                               selector:@selector(windowOcclusionChanged:)
+                                                   name:NSWindowDidChangeOcclusionStateNotification
+                                                 object:new_window];
+    } else if (self.visage_window) {
+      // Embedded windows are always considered visible since we don't track occlusion
+      self.visage_window->setVisible(true);
+    }
+
+    if (visageDebugEnabled())
+      visageDebugLog("window", "attached window=%p embedded=%d", new_window, embedded ? 1 : 0);
   }
   else if (self.visage_window)
     self.visage_window->closeWindow();
@@ -636,8 +904,18 @@ namespace visage {
 
 - (void)windowOcclusionChanged:(NSNotification*)notification {
   NSWindow* window = notification.object;
+  const auto occlusion = window.occlusionState;
+  const bool visible = occlusion & NSWindowOcclusionStateVisible;
   if (self.visage_window)
-    self.visage_window->setVisible(window.occlusionState & NSWindowOcclusionStateVisible);
+    self.visage_window->setVisible(visible);
+  if (visageDebugEnabled()) {
+    visageDebugLog("occlusion",
+                   "visible=%d occlusion=0x%lx windowVisible=%d miniaturized=%d",
+                   visible ? 1 : 0,
+                   static_cast<unsigned long>(occlusion),
+                   window.isVisible ? 1 : 0,
+                   window.isMiniaturized ? 1 : 0);
+  }
 }
 
 - (std::vector<std::string>)dropFileList:(id<NSDraggingInfo>)sender {
@@ -768,7 +1046,7 @@ namespace visage {
   }
 
   void* WindowMac::initWindow() const {
-    return (__bridge void*)InitialMetalLayer::layer();
+    return (__bridge void*)view_.layer;
   }
 
   void showMessageBox(std::string title, std::string message) {
@@ -851,7 +1129,7 @@ namespace visage {
     return std::make_unique<WindowMac>(bounds.width(), bounds.height(), scale, parent_handle);
   }
 
-  WindowMac::WindowMac(int x, int y, int width, int height, float scale, Decoration decoration) :
+    WindowMac::WindowMac(int x, int y, int width, int height, float scale, Decoration decoration) :
       Window(width, height), decoration_(decoration) {
     setDpiScale(scale);
     last_content_rect_ = NSMakeRect(x / scale, y / scale, width / scale, height / scale);
@@ -860,8 +1138,8 @@ namespace visage {
     rect.origin.x = 0;
     rect.origin.y = 0;
     view_ = [[VisageAppView alloc] initWithFrame:rect inWindow:this];
-    view_delegate_ = [[VisageAppViewDelegate alloc] initWithWindow:this];
-    view_.delegate = view_delegate_;
+    // view_delegate_ = [[VisageAppViewDelegate alloc] initWithWindow:this];
+    // view_.delegate = view_delegate_;
     view_.allow_quit = true;
 
     createWindow();
@@ -874,8 +1152,8 @@ namespace visage {
     CGRect view_frame = CGRectMake(0.0f, 0.0f, width / scale, height / scale);
 
     view_ = [[VisageAppView alloc] initWithFrame:view_frame inWindow:this];
-    view_delegate_ = [[VisageAppViewDelegate alloc] initWithWindow:this];
-    view_.delegate = view_delegate_;
+    // view_delegate_ = [[VisageAppViewDelegate alloc] initWithWindow:this];
+    // view_.delegate = view_delegate_;
     view_.allow_quit = false;
     [parent_view_ addSubview:view_];
 

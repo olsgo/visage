@@ -24,8 +24,34 @@
 #include "client_window_decoration.h"
 #include "visage_graphics/canvas.h"
 #include "visage_graphics/renderer.h"
+#include "visage_utils/time_utils.h"
 #include "visage_windowing/windowing.h"
 #include "window_event_handler.h"
+
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+
+namespace {
+  bool visageDebugEnabled() {
+    static const bool enabled = []() {
+      const char* env = std::getenv("NUPG_VISAGE_DEBUG");
+      return env && *env && *env != '0';
+    }();
+    return enabled;
+  }
+
+  void visageDebugLog(const char* tag, const char* format, ...) {
+    if (!visageDebugEnabled())
+      return;
+    std::fprintf(stderr, "[nuPG][Visage][%s] ", tag);
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+    std::fprintf(stderr, "\n");
+  }
+}
 
 namespace visage {
   TopLevelFrame::TopLevelFrame(ApplicationEditor* editor) : editor_(editor) { }
@@ -60,6 +86,17 @@ namespace visage {
     top_level_->addChild(this);
 
     event_handler_.request_redraw = [this](Frame* frame) {
+      if (visageDebugEnabled() && frame && frame->name() == "PhysicsGraph") {
+        static uint64_t last_redraw_log_us = 0;
+        const uint64_t now = time::microseconds();
+        if (now - last_redraw_log_us >= 1000000) {
+          last_redraw_log_us = now;
+          visageDebugLog("redraw",
+                         "frame=%s stale=%zu",
+                         frame->name().c_str(),
+                         stale_children_.size());
+        }
+      }
       if (std::find(stale_children_.begin(), stale_children_.end(), frame) == stale_children_.end())
         stale_children_.push_back(frame);
     };
@@ -107,6 +144,18 @@ namespace visage {
   void ApplicationEditor::addToWindow(Window* window) {
     window_ = window;
 
+    if (visageDebugEnabled()) {
+      visageDebugLog("editor",
+                     "addToWindow window=%p init=%p native=%p display=%p size=%dx%d dpi=%.2f",
+                     window_,
+                     window_ ? window_->initWindow() : nullptr,
+                     window_ ? window_->nativeHandle() : nullptr,
+                     window_ ? window_->globalDisplay() : nullptr,
+                     window_ ? window_->clientWidth() : 0,
+                     window_ ? window_->clientHeight() : 0,
+                     window_ ? window_->dpiScale() : 0.0f);
+    }
+
     Renderer::instance().initialize(window_->initWindow(), window->globalDisplay());
     canvas_->pairToWindow(window_->nativeHandle(), window->clientWidth(), window->clientHeight());
     top_level_->setDpiScale(window_->dpiScale());
@@ -142,17 +191,52 @@ namespace visage {
   }
 
   void ApplicationEditor::drawWindow() {
-    if (window_ && !window_->isVisible())
+    if (window_ && !window_->isVisible()) {
+      if (visageDebugEnabled()) {
+        static uint64_t last_hidden_log_us = 0;
+        const uint64_t now = time::microseconds();
+        if (now - last_hidden_log_us >= 1000000) {
+          last_hidden_log_us = now;
+          visageDebugLog("drawWindow", "skipped (window hidden)");
+        }
+      }
       return;
+    }
 
-    if (width() == 0 || height() == 0)
+    if (width() == 0 || height() == 0) {
+      if (visageDebugEnabled()) {
+        static uint64_t last_size_log_us = 0;
+        const uint64_t now = time::microseconds();
+        if (now - last_size_log_us >= 1000000) {
+          last_size_log_us = now;
+          visageDebugLog("drawWindow", "skipped (size=0x0)");
+        }
+      }
       return;
+    }
+
+    if (visageDebugEnabled()) {
+      static uint64_t last_log_us = 0;
+      const uint64_t now = time::microseconds();
+      if (now - last_log_us >= 1000000) {
+        last_log_us = now;
+        visageDebugLog("drawWindow",
+                       "visible=%d size=%.1fx%.1f initialized=%d stale=%zu",
+                       window_ ? (window_->isVisible() ? 1 : 0) : 0,
+                       width(),
+                       height(),
+                       initialized() ? 1 : 0,
+                       stale_children_.size());
+      }
+    }
 
     if (!initialized())
       init();
 
-    drawStaleChildren();
-    canvas_->submit();
+    if (!stale_children_.empty()) {
+      drawStaleChildren();
+      canvas_->submit();
+    }
   }
 
   void ApplicationEditor::setFixedAspectRatio(bool fixed) {

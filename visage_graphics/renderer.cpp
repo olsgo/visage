@@ -25,6 +25,30 @@
 
 #include <bgfx/bgfx.h>
 #include <bgfx/platform.h>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
+
+namespace {
+  bool visageDebugEnabled() {
+    static const bool enabled = []() {
+      const char* env = std::getenv("NUPG_VISAGE_DEBUG");
+      return env && *env && *env != '0';
+    }();
+    return enabled;
+  }
+
+  void visageDebugLog(const char* tag, const char* format, ...) {
+    if (!visageDebugEnabled())
+      return;
+    std::fprintf(stderr, "[nuPG][Visage][%s] ", tag);
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
+    std::fprintf(stderr, "\n");
+  }
+}
 
 namespace visage {
   class GraphicsCallbackHandler : public bgfx::CallbackI {
@@ -62,7 +86,7 @@ namespace visage {
 #if VISAGE_WINDOWS
     return BGFX_RESET_FLIP_AFTER_RENDER;
 #elif VISAGE_MAC
-    return BGFX_RESET_FLIP_AFTER_RENDER | BGFX_RESET_VSYNC;
+    return BGFX_RESET_FLIP_AFTER_RENDER;  // VSYNC removed: CVDisplayLink + CAMetalLayer already sync
 #elif VISAGE_LINUX
     return BGFX_RESET_VSYNC;
 #else
@@ -105,6 +129,9 @@ namespace visage {
     if (initialized_)
       return;
 
+    if (visageDebugEnabled())
+      visageDebugLog("renderer", "initialize window=%p display=%p", model_window, display);
+
     callback_handler_ = std::make_unique<GraphicsCallbackHandler>();
     initialized_ = true;
     startRenderThread();
@@ -121,6 +148,11 @@ namespace visage {
 
     bgfx::RendererType::Enum supported_renderers[bgfx::RendererType::Count];
     uint8_t num_supported = bgfx::getSupportedRenderers(bgfx::RendererType::Count, supported_renderers);
+    if (visageDebugEnabled()) {
+      for (uint8_t i = 0; i < num_supported; ++i) {
+        visageDebugLog("renderer", "supported=%s", bgfx::getRendererName(supported_renderers[i]));
+      }
+    }
 
 #if VISAGE_WINDOWS
     bgfx_init.type = bgfx::RendererType::Direct3D11;
@@ -154,11 +186,20 @@ namespace visage {
     bgfx::init(bgfx_init);
     VISAGE_ASSERT(bgfx::getRendererType() == bgfx_init.type);
     swap_chain_supported_ = bgfx::getCaps()->supported & BGFX_CAPS_SWAP_CHAIN;
+
+    if (visageDebugEnabled()) {
+      visageDebugLog("renderer",
+                     "active=%s swap_chain=%d",
+                     bgfx::getRendererName(bgfx::getRendererType()),
+                     swap_chain_supported_ ? 1 : 0);
+    }
   }
 
   void Renderer::resetResolution(int width, int height) {
 #if VISAGE_MAC
     bgfx::reset(width, height, resetFlags());
+    if (visageDebugEnabled())
+      visageDebugLog("renderer", "resetResolution %dx%d", width, height);
 #endif
   }
 

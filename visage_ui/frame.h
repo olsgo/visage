@@ -303,18 +303,7 @@ namespace visage {
 
     void drawToRegion(Canvas& canvas);
 
-    void setDpiScale(float dpi_scale) {
-      bool changed = dpi_scale_ != dpi_scale;
-      dpi_scale_ = dpi_scale;
-
-      if (changed) {
-        on_dpi_change_.callback();
-        redraw();
-      }
-
-      for (Frame* child : children_)
-        child->setDpiScale(dpi_scale);
-    }
+    void setDpiScale(float dpi_scale);
 
     float dpiScale() const { return dpi_scale_; }
 

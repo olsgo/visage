@@ -151,6 +151,10 @@ namespace visage {
   }
 
   void Window::handleMouseDown(MouseButton button_id, int x, int y, int button_state, int modifiers) {
+    if (std::getenv("NUPG_VISAGE_DEBUG") && std::getenv("NUPG_VISAGE_DEBUG")[0] != '0') {
+      fprintf(stderr, "[nuPG][Visage][Window::handleMouseDown] x=%d y=%d handler=%p\n",
+              x, y, (void*)event_handler_);
+    }
     if (event_handler_ == nullptr)
       return;
 

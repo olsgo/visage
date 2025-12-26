@@ -37,7 +37,11 @@ namespace visage {
 
     WindowlessMetalLayer() {
       metal_layer_ = [CAMetalLayer layer];
-      metal_layer_.colorspace = CGColorSpaceCreateWithName(kCGColorSpaceDisplayP3);
+      metal_layer_.pixelFormat = MTLPixelFormatBGRA8Unorm;
+      CGColorSpaceRef colorSpace = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+      metal_layer_.colorspace = colorSpace;
+      if (colorSpace)
+        CGColorSpaceRelease(colorSpace);
     }
 
     CAMetalLayer* metal_layer_ = nullptr;
