@@ -440,6 +440,10 @@ static CVReturn DisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeSt
   CAMetalLayer* metalLayer = (CAMetalLayer*)self.layer;
   display_count++;
 
+  // Throttling removed to allow 60Hz smooth rendering.
+  // The 'presentsWithTransaction = NO' fix resolves the main thread blocking issue,
+  // so we can now safely render at the native DisplayLink rate.
+  /*
   // Frame throttling: skip if less than 30ms since last render (cap at ~33Hz)
   // This prevents CVDisplayLink from flooding the main queue at 60Hz
   static constexpr uint64_t kMinFrameIntervalUs = 30000;  // 30ms = ~33Hz
@@ -447,6 +451,7 @@ static CVReturn DisplayLinkCallback(CVDisplayLinkRef displayLink, const CVTimeSt
   if (last_render_us > 0 && (now_us - last_render_us) < kMinFrameIntervalUs) {
     return;  // Skip this frame - too soon since last render
   }
+  */
 
   if (visageDebugEnabled() && shouldLogEvery(last_display_log_us, 1000000)) {
     const CGSize bounds_size = self.bounds.size;
